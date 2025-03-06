@@ -14,4 +14,17 @@
 	</Content>
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Remove=".env" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update=".env.template">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update=".env">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

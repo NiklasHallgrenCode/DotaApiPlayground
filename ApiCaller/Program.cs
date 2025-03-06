@@ -7,6 +7,7 @@ public class Program
     private const int MatchLimit = 10000;
     private const int DaysPeer = 10000;
     private const int LobbyType = 7;
+    private const int NumberOfPeers = 5;
 
     public static async Task Main()
     {
@@ -33,7 +34,7 @@ public class Program
 
         var topPeers = peersData
             .Where(p => p.AccountId.HasValue)
-            .Take(15)
+            .Take(NumberOfPeers)
             .ToList();
 
         var peersDictionary = topPeers
@@ -71,48 +72,55 @@ public class Program
 
         StringBuilder sb = new StringBuilder();
 
+        var peerTitles = string.Join(",", wonGamesWithPlayer.Select(w => $"{w.PlayerName} ({w.AccountId})"));
+
+        var titleString =
+            $"MatchId,IsWin,WonGames,MatchDate,AverageRank,Teammate1,Teammate2,Teammate3,Teammate4,{peerTitles}";
+
+        sb.AppendLine(titleString);
+
         foreach (var match in playerMatches)
         {
             string matchDate = ConvertUnixTimeToDateString(match.StartTime);
             bool isWin = winningMatchIds.Contains(match.MatchId);
 
-            var teammateNames = new List<string>();
+            var teammateIds = new List<string>();
             foreach (var peerHistory in peerMatchHistories)
             {
                 if (peerHistory.Matches.Any(m => m.MatchId == match.MatchId))
                 {
                     if (peersDictionary.TryGetValue(peerHistory.AccountId, out string? personaName))
                     {
-                        teammateNames.Add(personaName);
+                        teammateIds.Add(peerHistory.AccountId);
                     }
                     else
                     {
-                        teammateNames.Add("Unknown Peer");
+                        teammateIds.Add("Unknown Peer");
                     }
                 }
             }
 
             wonGames += isWin ? 1 : -1;
 
-            foreach (var teammateName in teammateNames)
+            foreach (var teammateId in teammateIds)
             {
-                var player = wonGamesWithPlayer.FirstOrDefault(w => w.PlayerName == teammateName);
+                var player = wonGamesWithPlayer.FirstOrDefault(w => w.AccountId.Value.ToString() == teammateId);
                 if (player != null)
                 {
                     player.Wins += isWin ? 1 : -1;
                 }
             }
 
-            string teamString = BuildTeammateString(teammateNames);
+            string teamString = BuildTeammateString(teammateIds, peersDictionary);
             string winsString = BuildWinsString(wonGamesWithPlayer);
 
-            string stringToWrite = $"{match.MatchId},{(isWin ? "W" : "L")},{wonGames},{matchDate},{(match.AverageRank == null ? "0" : match.AverageRank)},{teamString},{winsString}";
+            string stringToWrite = $"{match.MatchId},{(isWin ? "true" : "false")},{wonGames},{matchDate},{(match.AverageRank == null ? "0" : match.AverageRank)},{teamString},{winsString}";
             sb.AppendLine(stringToWrite);
         }
         Console.WriteLine(sb);
 
         // Define the file path
-        string filePath = "output.txt";
+        string filePath = "output.csv";
 
         // Write the CSV string to the file
         File.WriteAllText(filePath, sb.ToString());
@@ -137,11 +145,12 @@ public class Program
     private static string BuildWinsString(List<PlayerStats> wonGamesWithPlayer)
     {
 
-        var nameWithCounts = wonGamesWithPlayer.OrderBy(w => w.PlayerName).Select(player =>
+        var nameWithCounts = wonGamesWithPlayer.Select(player =>
         {
             //if (teammateNames.Contains(dict.Key))
             //{
-                return $"{player.AccountId},{player.PlayerName},{player.Wins}";
+            //return $"{player.AccountId},{player.PlayerName},{player.Wins}";
+            return player.Wins.ToString();
             //}
             //return $"{dict.Key};";
         }).ToList();
@@ -149,15 +158,23 @@ public class Program
         return string.Join(",", nameWithCounts);
     }
 
-    private static string BuildTeammateString(List<string> teammateNames)
+    private static string BuildTeammateString(List<string> teammateIds, Dictionary<string, string> peersDictionary)
     {
-        for (int i = 0; i < 5; i++)
+
+        List<string> teammatesList = new List<string>();
+
+
+        for (int i = 0; i < 4; i++)
         {
-            if (teammateNames.Count <= i)
+            if (teammateIds.Count <= i)
             {
-                teammateNames.Add("RANDOM");
+                teammatesList.Add("RANDOM");
+            }
+            else
+            {
+                teammatesList.Add($"{peersDictionary[teammateIds[i]]} ({teammateIds[i]})");
             }
         }
-        return string.Join(",", teammateNames);
+        return string.Join(",", teammatesList);
     }
 }
