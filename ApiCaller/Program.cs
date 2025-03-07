@@ -4,12 +4,113 @@ using DotNetEnv;
 
 public class Program
 {
-    private const int MatchLimit = 10000;
-    private const int DaysPeer = 10000;
-    private const int LobbyType = 7;
-    private const int NumberOfPeers = 5;
+    private const int MatchLimit = int.MaxValue;
+    private const int DaysPeer = int.MaxValue;
+    private enum LobbyTypeEnum
+    {
+        Normal = 0,
+        Ranked = 7
+    }
+
+    private enum GameModeEnum
+    {
+        AllPick = 1,
+        AllDraft = 22, //Ranked Pick
+        Turbo = 23,
+
+    }
+    private const int LobbyType = (int)LobbyTypeEnum.Normal;
+    private const int GameMode = (int)GameModeEnum.AllDraft;
+    private const int NumberOfPeers = 30;
+    private static Dictionary<string, string> medalToRankDictionary = RankToMmr.GetRankMmrMap();
 
     public static async Task Main()
+    {
+        Env.Load();
+        string playerId = Env.GetString("PLAYER_ID");
+        using var httpClient = new HttpClient();
+
+        string baseUrl = "https://api.opendota.com/api/players";
+        string playerMatchesUrl = $"{baseUrl}/{playerId}/matches?limit={MatchLimit}&lobby_type={LobbyType}&game_mode={GameMode}";
+        string peersUrl = $"{baseUrl}/{playerId}/peers?lobby_type={LobbyType}&date={DaysPeer}";
+        string playerWinUrl = $"{playerMatchesUrl}&win=1";
+
+        var playerMatchesTask = FetchDataAsync<Match>(httpClient, playerMatchesUrl);
+        var peersTask = FetchDataAsync<PlayerData>(httpClient, peersUrl);
+        var playerWinMatchesTask = FetchDataAsync<Match>(httpClient, playerWinUrl);
+
+        await Task.WhenAll(playerMatchesTask, peersTask, playerWinMatchesTask);
+
+        var playerMatches = playerMatchesTask.Result;
+        var peersData = peersTask.Result;
+        var playerWinMatches = playerWinMatchesTask.Result;
+
+        var winningMatchIds = new HashSet<long>(playerWinMatches.Select(m => m.MatchId));
+
+        var topPeers = peersData
+            .Where(p => p.AccountId.HasValue)
+            .Take(NumberOfPeers)
+            .ToList();
+
+        var peerMatchesTasks = topPeers.Select(async peer =>
+        {
+            string accountIdString = peer.AccountId?.ToString() ?? "Unknown";
+            string url = $"{baseUrl}/{accountIdString}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
+            var matches = await FetchDataAsync<Match>(httpClient, url);
+
+            return new MatchHistory
+            {
+                AccountId = accountIdString,
+                Matches = matches
+            };
+        });
+
+        var peerMatchHistories = await Task.WhenAll(peerMatchesTasks);
+
+        playerMatches.Reverse();
+
+        StringBuilder sb = new StringBuilder();
+
+        int games = 0;
+
+        foreach (var match in playerMatches)
+        {
+            var continueLoop = false;
+            foreach (var peerHistory in peerMatchHistories)
+            {
+                if (peerHistory.Matches.Any(m => m.MatchId == match.MatchId))
+                {
+                    continueLoop = true;
+                }
+            }
+
+            if (continueLoop)
+                continue;
+
+            games++;
+
+            string matchDate = ConvertUnixTimeToDateString(match.StartTime);
+            bool isWin = winningMatchIds.Contains(match.MatchId);
+
+            medalToRankDictionary.TryGetValue(match.AverageRank.GetValueOrDefault(0).ToString(), out string rankAsMmr);
+
+            rankAsMmr = string.IsNullOrWhiteSpace(rankAsMmr) ? "0" : rankAsMmr;
+
+            string debugStringToWrite =
+                $"{match.MatchId} / {matchDate} / {(isWin ? "W" : "L")} / {(match.AverageRank == null ? "0" : match.AverageRank)} ({rankAsMmr})";
+
+            Console.WriteLine(debugStringToWrite);
+            sb.AppendLine(debugStringToWrite);
+        }
+        Console.WriteLine(sb);
+
+        string filePath = "output1.csv";
+
+        File.WriteAllText(filePath, sb.ToString());
+        Console.WriteLine($"Found {games} matches");
+    }
+
+    public static async Task Teammates()
     {
         Env.Load();
         string playerId = Env.GetString("PLAYER_ID");
@@ -120,7 +221,7 @@ public class Program
         Console.WriteLine(sb);
 
         // Define the file path
-        string filePath = "output.csv";
+        string filePath = "output2.csv";
 
         // Write the CSV string to the file
         File.WriteAllText(filePath, sb.ToString());
