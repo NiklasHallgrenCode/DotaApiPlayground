@@ -53,7 +53,7 @@ public class Profile
     public bool? IsSubscriber { get; set; }
 }
 
-public class Match
+public class PlayerMatch
 {
     [JsonPropertyName("match_id")]
     public long MatchId { get; set; }
@@ -137,7 +137,7 @@ public class Match
 public class MatchHistory
 {
     public string AccountId { get; set; }
-    public List<Match> Matches { get; set; }
+    public List<PlayerMatch> Matches { get; set; }
 }
 public class Player
 {
@@ -429,3 +429,4 @@ public class PlayerStats
     public string PlayerName { get; set; }
     public int Wins { get; set; }
 }
+

@@ -2,10 +2,12 @@
 using System.Text.Json;
 using DotNetEnv;
 
-public class Program
+public static class Program
 {
-    private const int MatchLimit = int.MaxValue;
+    private const int MatchLimit = 50;
     private const int DaysPeer = int.MaxValue;
+    private const int NumberOfPeers = 1000;
+
     private enum LobbyTypeEnum
     {
         Normal = 0,
@@ -15,29 +17,65 @@ public class Program
     private enum GameModeEnum
     {
         AllPick = 1,
-        AllDraft = 22, //Ranked Pick
-        Turbo = 23,
-
+        AllDraft = 22,
+        Turbo = 23
     }
+
     private const int LobbyType = (int)LobbyTypeEnum.Normal;
     private const int GameMode = (int)GameModeEnum.AllDraft;
-    private const int NumberOfPeers = 30;
-    private static Dictionary<string, string> medalToRankDictionary = RankToMmr.GetRankMmrMap();
+
+    private static readonly Dictionary<string, string> MedalToRankDictionary = RankToMmr.GetRankMmrMap();
+    private static readonly HttpClient HttpClient = new HttpClient();
+    private static readonly string PlayerId;
+    private static readonly string BaseUrl = "https://api.opendota.com/api/players";
+    private static readonly string BaseMatchesUrl = "https://api.opendota.com/api/matches";
+
+    static Program()
+    {
+        Env.Load();
+        PlayerId = Env.GetString("PLAYER_ID")
+            ?? throw new Exception("PLAYER_ID is missing or not set in .env");
+    }
 
     public static async Task Main()
     {
-        Env.Load();
-        string playerId = Env.GetString("PLAYER_ID");
-        using var httpClient = new HttpClient();
+        var topPeers = await GetTopPeersAsync(PlayerId, NumberOfPeers, DaysPeer, LobbyType);
 
-        string baseUrl = "https://api.opendota.com/api/players";
-        string playerMatchesUrl = $"{baseUrl}/{playerId}/matches?limit={MatchLimit}&lobby_type={LobbyType}&game_mode={GameMode}";
-        string peersUrl = $"{baseUrl}/{playerId}/peers?lobby_type={LobbyType}&date={DaysPeer}";
-        string playerWinUrl = $"{playerMatchesUrl}&win=1";
+        var excludedQueryString = string.Join("&", topPeers
+            .Where(tp => tp.AccountId.HasValue)
+            .Select(tp => $"excluded_account_id={tp.AccountId.Value}"));
 
-        var playerMatchesTask = FetchDataAsync<Match>(httpClient, playerMatchesUrl);
-        var peersTask = FetchDataAsync<PlayerData>(httpClient, peersUrl);
-        var playerWinMatchesTask = FetchDataAsync<Match>(httpClient, playerWinUrl);
+        string playerMatchesUrl = BuildMatchesUrl(PlayerId, MatchLimit, LobbyType, GameMode, excludedQueryString);
+        string playerWinUrl = playerMatchesUrl + "&win=1";
+
+        var playerMatchesTask = FetchListAsync<PlayerMatch>(playerMatchesUrl);
+        var playerWinMatchesTask = FetchListAsync<PlayerMatch>(playerWinUrl);
+
+        await Task.WhenAll(playerMatchesTask, playerWinMatchesTask);
+
+        var playerMatches = playerMatchesTask.Result;
+        var playerWinMatches = playerWinMatchesTask.Result;
+
+        playerMatches.Reverse();
+
+        var matchDataTasks = playerMatches
+            .Select(m => FetchSingleAsync<MatchData>($"{BaseMatchesUrl}/{m.MatchId}"))
+            .ToList();
+
+        var matchData = await Task.WhenAll(matchDataTasks);
+
+        ProcessMatchesWithPeers(matchData, new List<MatchHistory>(), playerWinMatches);
+    }
+
+    public static async Task OnlyPlayer()
+    {
+        string playerMatchesUrl = BuildMatchesUrl(PlayerId, MatchLimit, LobbyType, GameMode);
+        string peersUrl = $"{BaseUrl}/{PlayerId}/peers?lobby_type={LobbyType}&date={DaysPeer}";
+        string playerWinUrl = playerMatchesUrl + "&win=1";
+
+        var playerMatchesTask = FetchListAsync<PlayerMatch>(playerMatchesUrl);
+        var peersTask = FetchListAsync<PlayerData>(peersUrl);
+        var playerWinMatchesTask = FetchListAsync<PlayerMatch>(playerWinUrl);
 
         await Task.WhenAll(playerMatchesTask, peersTask, playerWinMatchesTask);
 
@@ -52,86 +90,52 @@ public class Program
             .Take(NumberOfPeers)
             .ToList();
 
-        var peerMatchesTasks = topPeers.Select(async peer =>
-        {
-            string accountIdString = peer.AccountId?.ToString() ?? "Unknown";
-            string url = $"{baseUrl}/{accountIdString}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
-            var matches = await FetchDataAsync<Match>(httpClient, url);
-
-            return new MatchHistory
-            {
-                AccountId = accountIdString,
-                Matches = matches
-            };
-        });
-
-        var peerMatchHistories = await Task.WhenAll(peerMatchesTasks);
+        var peerMatchHistories = await FetchPeerMatchHistories(topPeers);
 
         playerMatches.Reverse();
 
-        StringBuilder sb = new StringBuilder();
-
+        var sb = new StringBuilder();
         int games = 0;
 
         foreach (var match in playerMatches)
         {
-            var continueLoop = false;
-            foreach (var peerHistory in peerMatchHistories)
-            {
-                if (peerHistory.Matches.Any(m => m.MatchId == match.MatchId))
-                {
-                    continueLoop = true;
-                }
-            }
-
-            if (continueLoop)
-                continue;
+            bool skip = peerMatchHistories.Any(ph => ph.Matches.Any(m => m.MatchId == match.MatchId));
+            if (skip) continue;
 
             games++;
 
             string matchDate = ConvertUnixTimeToDateString(match.StartTime);
             bool isWin = winningMatchIds.Contains(match.MatchId);
 
-            medalToRankDictionary.TryGetValue(match.AverageRank.GetValueOrDefault(0).ToString(), out string rankAsMmr);
+            var avgRankKey = match.AverageRank?.ToString() ?? "";
+            MedalToRankDictionary.TryGetValue(avgRankKey, out string mmrString);
+            mmrString ??= "0";
 
-            rankAsMmr = string.IsNullOrWhiteSpace(rankAsMmr) ? "0" : rankAsMmr;
-
-            string debugStringToWrite =
-                $"{match.MatchId} / {matchDate} / {(isWin ? "W" : "L")} / {(match.AverageRank == null ? "0" : match.AverageRank)} ({rankAsMmr})";
-
-            Console.WriteLine(debugStringToWrite);
-            sb.AppendLine(debugStringToWrite);
+            string line = $"{match.MatchId} / {matchDate} / {(isWin ? "W" : "L")} / {avgRankKey} ({mmrString})";
+            Console.WriteLine(line);
+            sb.AppendLine(line);
         }
-        Console.WriteLine(sb);
 
-        string filePath = "output1.csv";
-
-        File.WriteAllText(filePath, sb.ToString());
+        Console.WriteLine(sb.ToString());
+        File.WriteAllText("output1.csv", sb.ToString());
         Console.WriteLine($"Found {games} matches");
     }
 
     public static async Task Teammates()
     {
-        Env.Load();
-        string playerId = Env.GetString("PLAYER_ID");
-        using var httpClient = new HttpClient();
+        string playerMatchesUrl = $"{BaseUrl}/{PlayerId}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
+        string peersUrl = $"{BaseUrl}/{PlayerId}/peers?lobby_type={LobbyType}&date={DaysPeer}";
+        string playerWinUrl = playerMatchesUrl + "&win=1";
 
-        string baseUrl = "https://api.opendota.com/api/players";
-        string playerMatchesUrl = $"{baseUrl}/{playerId}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
-        string peersUrl = $"{baseUrl}/{playerId}/peers?lobby_type={LobbyType}&date={DaysPeer}";
-        string playerWinUrl = $"{playerMatchesUrl}&win=1";
-
-        var playerMatchesTask = FetchDataAsync<Match>(httpClient, playerMatchesUrl);
-        var peersTask = FetchDataAsync<PlayerData>(httpClient, peersUrl);
-        var playerWinMatchesTask = FetchDataAsync<Match>(httpClient, playerWinUrl);
+        var playerMatchesTask = FetchListAsync<PlayerMatch>(playerMatchesUrl);
+        var peersTask = FetchListAsync<PlayerData>(peersUrl);
+        var playerWinMatchesTask = FetchListAsync<PlayerMatch>(playerWinUrl);
 
         await Task.WhenAll(playerMatchesTask, peersTask, playerWinMatchesTask);
 
         var playerMatches = playerMatchesTask.Result;
         var peersData = peersTask.Result;
         var playerWinMatches = playerWinMatchesTask.Result;
-
-        var winningMatchIds = new HashSet<long>(playerWinMatches.Select(m => m.MatchId));
 
         var topPeers = peersData
             .Where(p => p.AccountId.HasValue)
@@ -145,38 +149,24 @@ public class Program
                 peer => peer.Personaname
             );
 
-        var peerMatchesTasks = topPeers.Select(async peer =>
-        {
-            string accountIdString = peer.AccountId?.ToString() ?? "Unknown";
-            string url = $"{baseUrl}/{accountIdString}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
-            var matches = await FetchDataAsync<Match>(httpClient, url);
-
-            return new MatchHistory
-            {
-                AccountId = accountIdString,
-                Matches = matches
-            };
-        });
-
-        var peerMatchHistories = await Task.WhenAll(peerMatchesTasks);
+        var peerMatchHistories = await FetchPeerMatchHistories(topPeers);
 
         playerMatches.Reverse();
 
+        var winningMatchIds = new HashSet<long>(playerWinMatches.Select(m => m.MatchId));
         int wonGames = 0;
 
-        List<PlayerStats> wonGamesWithPlayer = new List<PlayerStats>();
+        var wonGamesWithPlayer = topPeers
+            .Select(p => new PlayerStats
+            {
+                AccountId = p.AccountId,
+                PlayerName = p.Personaname
+            })
+            .ToList();
 
-        foreach (var peer in topPeers)
-        {
-            wonGamesWithPlayer.Add(new PlayerStats { AccountId = peer.AccountId, PlayerName = peer.Personaname });
-        }
-
-        StringBuilder sb = new StringBuilder();
-
+        var sb = new StringBuilder();
         var peerTitles = string.Join(",", wonGamesWithPlayer.Select(w => $"{w.PlayerName} ({w.AccountId})"));
-
-        var titleString =
-            $"MatchId,IsWin,WonGames,MatchDate,AverageRank,Teammate1,Teammate2,Teammate3,Teammate4,{peerTitles}";
+        var titleString = $"MatchId,IsWin,WonGamesSoFar,MatchDate,AverageRank,Teammate1,Teammate2,Teammate3,Teammate4,{peerTitles}";
 
         sb.AppendLine(titleString);
 
@@ -186,96 +176,232 @@ public class Program
             bool isWin = winningMatchIds.Contains(match.MatchId);
 
             var teammateIds = new List<string>();
-            foreach (var peerHistory in peerMatchHistories)
+            foreach (var pmh in peerMatchHistories)
             {
-                if (peerHistory.Matches.Any(m => m.MatchId == match.MatchId))
+                bool peerInMatch = pmh.Matches.Any(m => m.MatchId == match.MatchId);
+                if (peerInMatch)
                 {
-                    if (peersDictionary.TryGetValue(peerHistory.AccountId, out string? personaName))
-                    {
-                        teammateIds.Add(peerHistory.AccountId);
-                    }
-                    else
-                    {
-                        teammateIds.Add("Unknown Peer");
-                    }
+                    teammateIds.Add(pmh.AccountId);
                 }
             }
 
             wonGames += isWin ? 1 : -1;
 
-            foreach (var teammateId in teammateIds)
+            foreach (var tId in teammateIds)
             {
-                var player = wonGamesWithPlayer.FirstOrDefault(w => w.AccountId.Value.ToString() == teammateId);
-                if (player != null)
+                var peerStats = wonGamesWithPlayer.FirstOrDefault(w => w.AccountId?.ToString() == tId);
+                if (peerStats != null)
                 {
-                    player.Wins += isWin ? 1 : -1;
+                    peerStats.Wins += isWin ? 1 : -1;
                 }
             }
 
-            string teamString = BuildTeammateString(teammateIds, peersDictionary);
+            string teammatesCsv = BuildTeammateCsvRow(teammateIds, peersDictionary);
             string winsString = BuildWinsString(wonGamesWithPlayer);
 
-            string stringToWrite = $"{match.MatchId},{(isWin ? "true" : "false")},{wonGames},{matchDate},{(match.AverageRank == null ? "0" : match.AverageRank)},{teamString},{winsString}";
-            sb.AppendLine(stringToWrite);
+            string averageRank = match.AverageRank?.ToString() ?? "0";
+            string line = $"{match.MatchId},{isWin},{wonGames},{matchDate},{averageRank},{teammatesCsv},{winsString}";
+
+            sb.AppendLine(line);
         }
-        Console.WriteLine(sb);
 
-        // Define the file path
-        string filePath = "output2.csv";
-
-        // Write the CSV string to the file
-        File.WriteAllText(filePath, sb.ToString());
+        Console.WriteLine(sb.ToString());
+        File.WriteAllText("output2.csv", sb.ToString());
         Console.WriteLine($"Found {playerMatches.Count} matches");
     }
 
-    private static async Task<List<T>> FetchDataAsync<T>(HttpClient client, string url)
+    private static async Task<List<T>> FetchListAsync<T>(string url)
     {
-        string responseString = await client.GetStringAsync(url);
-        return JsonSerializer.Deserialize<List<T>>(responseString, new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        }) ?? new List<T>();
+        string responseString = await HttpClient.GetStringAsync(url);
+
+        return JsonSerializer.Deserialize<List<T>>(
+            responseString,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+        ) ?? new List<T>();
     }
 
-    private static string ConvertUnixTimeToDateString(long unixTimeSeconds)
+    private static async Task<T?> FetchSingleAsync<T>(string url)
     {
-        var dateTime = DateTimeOffset.FromUnixTimeSeconds(unixTimeSeconds).UtcDateTime;
+        try
+        {
+            var responseString = await HttpClient.GetStringAsync(url);
+
+            if (string.IsNullOrWhiteSpace(responseString))
+            {
+                return default;
+            }
+
+            return JsonSerializer.Deserialize<T>(
+                responseString,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+            );
+        }
+        catch (HttpRequestException httpEx)
+        {
+            return default;
+        }
+        catch (JsonException jsonEx)
+        {
+            return default;
+        }
+    }
+
+
+
+    private static async Task<List<PlayerData>> GetTopPeersAsync(string playerId, int numberOfPeers, int daysPeer, int lobbyType)
+    {
+        string peersUrl = $"{BaseUrl}/{playerId}/peers?lobby_type={lobbyType}&date={daysPeer}";
+        var peersData = await FetchListAsync<PlayerData>(peersUrl);
+
+        return peersData
+            .Where(p => p.AccountId.HasValue)
+            .Take(numberOfPeers)
+            .ToList();
+    }
+
+    private static async Task<MatchHistory[]> FetchPeerMatchHistories(IEnumerable<PlayerData> topPeers)
+    {
+        var tasks = topPeers.Select(async peer =>
+        {
+            string accountIdString = peer.AccountId?.ToString() ?? "Unknown";
+            string url = $"{BaseUrl}/{accountIdString}/matches?limit={MatchLimit}&lobby_type={LobbyType}";
+            var matches = await FetchListAsync<PlayerMatch>(url);
+
+            return new MatchHistory
+            {
+                AccountId = accountIdString,
+                Matches = matches
+            };
+        });
+
+        return await Task.WhenAll(tasks);
+    }
+
+    private static string BuildMatchesUrl(
+        string playerId,
+        int matchLimit,
+        int lobbyType,
+        int gameMode,
+        string excludedQueryString = null
+    )
+    {
+        var url = $"{BaseUrl}/{playerId}/matches?limit={matchLimit}&lobby_type={lobbyType}&game_mode={gameMode}";
+
+        if (!string.IsNullOrWhiteSpace(excludedQueryString))
+        {
+            url += "&" + excludedQueryString;
+        }
+
+        return url;
+    }
+
+    private static void ProcessMatchesWithPeers(
+        MatchData[] matches,
+        IEnumerable<MatchHistory> peerMatchHistories,
+        List<PlayerMatch> playerWinMatches
+    )
+    {
+        var winningMatchIds = new HashSet<long>(playerWinMatches.Select(m => m.MatchId));
+        var sb = new StringBuilder();
+        int games = 0;
+
+        foreach (var match in matches)
+        {
+            if (match == null) continue;
+
+            bool skip = peerMatchHistories.Any(ph => ph.Matches.Any(m => m.MatchId == match.MatchId));
+            if (skip) continue;
+
+            games++;
+
+            var userPlayer = match.Players.FirstOrDefault(p => p.AccountId?.ToString() == PlayerId);
+            if (userPlayer == null) continue;
+
+            bool userIsRadiant = userPlayer.IsRadiant ?? false;
+
+            var opponentMmrList = match.Players
+                .Where(p => p.IsRadiant != userIsRadiant)
+                .Where(p => p.RankTier != null && MedalToRankDictionary.ContainsKey(p.RankTier.Value.ToString()))
+                .Select(p => int.Parse(MedalToRankDictionary[p.RankTier.Value.ToString()]))
+                .ToList();
+
+            var opponentImmortalListCount = match.Players.Where(p => p.IsRadiant != userIsRadiant).Count(p => p.RankTier != null && p.RankTier.Value == 80);
+
+            bool isWin = winningMatchIds.Contains(match.MatchId.Value);
+            int averageOpponentMmr = opponentMmrList.Any() ? (int)opponentMmrList.Average() : 0;
+            string approxMedal = GetClosestRank(averageOpponentMmr);
+
+            string matchDate = ConvertUnixTimeToDateString(match.StartTime);
+            string line = $"{match.MatchId} / {matchDate} / {(isWin ? "W" : "L")} / {approxMedal} ({averageOpponentMmr}) ({opponentMmrList.Count}) ({opponentImmortalListCount})";
+
+            Console.WriteLine(line);
+            sb.AppendLine(line);
+        }
+
+        Console.WriteLine(sb.ToString());
+        Console.WriteLine($"Found {games} matches after peer-exclusion filtering");
+        File.WriteAllText("output1.csv", sb.ToString());
+    }
+
+    private static string ConvertUnixTimeToDateString(long? unixTimeSeconds)
+    {
+        if (unixTimeSeconds == null) return "UnknownDate";
+
+        var dateTime = DateTimeOffset.FromUnixTimeSeconds(unixTimeSeconds.Value).UtcDateTime;
         return dateTime.ToString("yyyy-MM-dd");
     }
 
-    private static string BuildWinsString(List<PlayerStats> wonGamesWithPlayer)
+    private static string BuildTeammateCsvRow(List<string> teammateIds, Dictionary<string, string> peersDictionary)
     {
-
-        var nameWithCounts = wonGamesWithPlayer.Select(player =>
-        {
-            //if (teammateNames.Contains(dict.Key))
-            //{
-            //return $"{player.AccountId},{player.PlayerName},{player.Wins}";
-            return player.Wins.ToString();
-            //}
-            //return $"{dict.Key};";
-        }).ToList();
-
-        return string.Join(",", nameWithCounts);
-    }
-
-    private static string BuildTeammateString(List<string> teammateIds, Dictionary<string, string> peersDictionary)
-    {
-
-        List<string> teammatesList = new List<string>();
-
+        var list = new List<string>();
 
         for (int i = 0; i < 4; i++)
         {
-            if (teammateIds.Count <= i)
+            if (i < teammateIds.Count)
             {
-                teammatesList.Add("RANDOM");
+                string tId = teammateIds[i];
+                if (peersDictionary.TryGetValue(tId, out var personaName))
+                {
+                    list.Add($"{personaName} ({tId})");
+                }
+                else
+                {
+                    list.Add($"UnknownPeer ({tId})");
+                }
             }
             else
             {
-                teammatesList.Add($"{peersDictionary[teammateIds[i]]} ({teammateIds[i]})");
+                list.Add("RANDOM");
             }
         }
-        return string.Join(",", teammatesList);
+
+        return string.Join(",", list);
+    }
+
+    private static string BuildWinsString(List<PlayerStats> playerStats)
+    {
+        var counts = playerStats.Select(p => p.Wins.ToString());
+        return string.Join(",", counts);
+    }
+
+    public static string GetClosestRank(int targetMmr)
+    {
+        if (targetMmr >= 5620)
+            return "80";
+
+        var validEntries = MedalToRankDictionary
+            .Where(kv => !string.IsNullOrEmpty(kv.Value))
+            .Select(kv => new
+            {
+                RankCode = kv.Key,
+                ApproxMmr = int.Parse(kv.Value)
+            })
+            .ToList();
+
+        var bestMatch = validEntries
+            .OrderBy(x => Math.Abs(x.ApproxMmr - targetMmr))
+            .First();
+
+        return bestMatch.RankCode;
     }
 }
