@@ -1,10 +1,12 @@
-﻿using System.Text;
+﻿using System.Globalization;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DotNetEnv;
 
 public static class Program
 {
-    private const int MatchLimit = 50;
+    private const int MatchLimit = int.MaxValue;
     private const int DaysPeer = int.MaxValue;
     private const int NumberOfPeers = 1000;
 
@@ -27,6 +29,7 @@ public static class Program
     private static readonly Dictionary<string, string> MedalToRankDictionary = RankToMmr.GetRankMmrMap();
     private static readonly HttpClient HttpClient = new HttpClient();
     private static readonly string PlayerId;
+    private static readonly string PeerIds;
     private static readonly string BaseUrl = "https://api.opendota.com/api/players";
     private static readonly string BaseMatchesUrl = "https://api.opendota.com/api/matches";
 
@@ -35,9 +38,103 @@ public static class Program
         Env.Load();
         PlayerId = Env.GetString("PLAYER_ID")
             ?? throw new Exception("PLAYER_ID is missing or not set in .env");
+        PeerIds = Env.GetString("PEER_IDS")
+                ?? throw new Exception("PEER_IDS is missing or not set in .env");
     }
 
     public static async Task Main()
+    {
+        //var topPeers = await GetTopPeersAsync(PlayerId, NumberOfPeers, DaysPeer, LobbyType);
+
+        //var excludedQueryString = string.Join("&", topPeers
+        //    .Where(tp => tp.AccountId.HasValue && tp.AccountId.Value.ToString() != PeerId)
+        //    .Select(tp => $"excluded_account_id={tp.AccountId.Value}"));
+
+        var includedQueryString = string.Join("&", PeerIds.Split("&")
+            .Select(s => $"included_account_id={s}"));
+
+        string playerMatchesUrl = BuildMatchesUrl(PlayerId, MatchLimit, LobbyType, GameMode, null, includedQueryString);
+        string playerWinUrl = playerMatchesUrl + "&win=1";
+
+        var playerMatchesTask = FetchListAsync<PlayerMatch>(playerMatchesUrl);
+        var playerWinMatchesTask = FetchListAsync<PlayerMatch>(playerWinUrl);
+
+        await Task.WhenAll(playerMatchesTask, playerWinMatchesTask);
+
+        var playerMatches = playerMatchesTask.Result;
+        var playerWinMatches = playerWinMatchesTask.Result;
+
+        playerMatches.Reverse();
+
+        //var matchDataTasks = playerMatches
+        //    .Select(m => FetchSingleAsync<MatchData>($"{BaseMatchesUrl}/{m.MatchId}"))
+        //    .ToList();
+
+        //var matchData = await Task.WhenAll(matchDataTasks);
+
+        //ProcessMatchesWithPeers(matchData, new List<MatchHistory>(), playerWinMatches);
+
+        var winningMatchIds = new HashSet<long>(playerWinMatches.Select(m => m.MatchId));
+        var sb = new StringBuilder();
+        int games = 0;
+        int wins = 0;
+        int losses = 0;
+
+        sb.AppendLine("id,date,result,win_percent,wins,losses");
+
+        foreach (var match in playerMatches)
+        {
+            if (match == null) continue;
+
+            //bool skip = peerMatchHistories.Any(ph => ph.Matches.Any(m => m.MatchId == match.MatchId));
+            //if (skip) continue;
+
+
+            //var userPlayer = match.Players.FirstOrDefault(p => p.AccountId?.ToString() == PlayerId);
+            //if (userPlayer == null) continue;
+
+            //bool userIsRadiant = userPlayer.IsRadiant ?? false;
+
+            //var opponentMmrList = match.Players
+            //    .Where(p => p.IsRadiant != userIsRadiant)
+            //    .Where(p => p.RankTier != null && MedalToRankDictionary.ContainsKey(p.RankTier.Value.ToString()))
+            //    .Select(p => int.Parse(MedalToRankDictionary[p.RankTier.Value.ToString()]))
+            //    .ToList();
+
+            //var opponentImmortalListCount = match.Players.Where(p => p.IsRadiant != userIsRadiant).Count(p => p.RankTier != null && p.RankTier.Value == 80);
+
+            games++;
+            bool isWin = winningMatchIds.Contains(match.MatchId);
+
+            if (isWin)
+            {
+                wins++;
+            }
+            else
+            {
+                losses++;
+            }
+
+            double winPercentage = 0;
+
+            if (wins > 0 && games > 0)
+            {
+                winPercentage = ((double)wins / games) * 100;
+            }
+
+            string matchDate = ConvertUnixTimeToDateString(match.StartTime);
+            string line = $"{match.MatchId},{matchDate},{(isWin ? "W" : "L")},{winPercentage.ToString("F2", CultureInfo.InvariantCulture)}%,{wins},{losses}";
+
+            //Console.WriteLine(line);
+            sb.AppendLine(line);
+        }
+
+        Console.WriteLine(sb.ToString());
+        Console.WriteLine($"Found {games} matches");
+        File.WriteAllText($"{PlayerId}_{PeerIds}.csv", sb.ToString());
+    }
+
+    public static async Task MatchWithPeers()
     {
         var topPeers = await GetTopPeersAsync(PlayerId, NumberOfPeers, DaysPeer, LobbyType);
 
@@ -282,14 +379,21 @@ public static class Program
         int matchLimit,
         int lobbyType,
         int gameMode,
-        string excludedQueryString = null
+        string excludedQueryString = null,
+        string includedQueryString = null
     )
     {
-        var url = $"{BaseUrl}/{playerId}/matches?limit={matchLimit}&lobby_type={lobbyType}&game_mode={gameMode}";
+        //var url = $"{BaseUrl}/{playerId}/matches?limit={matchLimit}&lobby_type={lobbyType}&game_mode={gameMode}";
+        var url = $"{BaseUrl}/{playerId}/matches?limit={matchLimit}";
 
         if (!string.IsNullOrWhiteSpace(excludedQueryString))
         {
             url += "&" + excludedQueryString;
+        }
+
+        if (!string.IsNullOrWhiteSpace(includedQueryString))
+        {
+            url += "&" + includedQueryString;
         }
 
         return url;
