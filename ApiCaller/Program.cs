@@ -44,6 +44,77 @@ public static class Program
 
     public static async Task Main()
     {
+
+        var excludedQueryString = string.Join("&", PeerIds.Split("&")
+            .Select(s => $"excluded_account_id={s}"));
+
+
+        // Fetch matches
+        string playerMatchesUrl = BuildMatchesUrl(PlayerId, MatchLimit, LobbyType, GameMode, null, null);
+        string excludePlayerMatchesUrl = BuildMatchesUrl(PlayerId, MatchLimit, LobbyType, GameMode, excludedQueryString, null);
+        var playerMatchesTask = FetchListAsync<PlayerMatch>(playerMatchesUrl);
+        var excludePlayerMatchesTask = FetchListAsync<PlayerMatch>(excludePlayerMatchesUrl);
+        await Task.WhenAll(playerMatchesTask, excludePlayerMatchesTask);
+
+        var playerMatches = playerMatchesTask.Result;
+        var excludePlayerMatches = excludePlayerMatchesTask.Result;
+
+        // Reverse if needed (e.g., if they come newest-first and you want oldest-first)
+        playerMatches.Reverse();
+
+        // Group matches by month in the format "yyyy-MM"
+        var groupedMatches = playerMatches
+            .GroupBy(m => ConvertUnixTimeToDateTime(m.StartTime).ToString("yyyy-MM"))
+            .Select(g => new
+            {
+                YearMonth = g.Key,
+                Count = g.Count()
+            })
+            .OrderBy(x => x.YearMonth);
+
+        var groupedExcludeMatches = excludePlayerMatches
+            .GroupBy(m => ConvertUnixTimeToDateTime(m.StartTime).ToString("yyyy-MM"))
+            .Select(g => new
+            {
+                YearMonth = g.Key,
+                Count = g.Count()
+            })
+            .OrderBy(x => x.YearMonth);
+
+        // Build CSV
+        var sb = new StringBuilder();
+        sb.AppendLine("month,games");
+
+        foreach (var group in groupedMatches)
+        {
+            var excludeGroup = groupedExcludeMatches.FirstOrDefault(g => g.YearMonth == group.YearMonth);
+
+            if (excludeGroup != null)
+            {
+                sb.AppendLine($"{group.YearMonth} / {group.Count} / {excludeGroup.Count}");
+            }
+            else
+            {
+                sb.AppendLine($"{group.YearMonth} / {group.Count}");
+            }
+        }
+
+        Console.WriteLine(sb.ToString());
+        Console.WriteLine($"Found {playerMatches.Count} matches in total.");
+
+        // Write to CSV file
+        File.WriteAllText($"{PlayerId}_{PeerIds}_aggGanes.csv", sb.ToString());
+    }
+
+    private static DateTime ConvertUnixTimeToDateTime(long unixTime)
+    {
+        var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        return epoch.AddSeconds(unixTime).ToLocalTime();
+    }
+
+
+    public static async Task MainWithPeers()
+    {
         //var topPeers = await GetTopPeersAsync(PlayerId, NumberOfPeers, DaysPeer, LobbyType);
 
         //var excludedQueryString = string.Join("&", topPeers
